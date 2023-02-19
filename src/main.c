@@ -48,8 +48,12 @@ int     resolve_destination(char *str, t_info *info)
     inet_ntop(addr.ss_family, (void *)&((struct sockaddr_in *)&addr)->sin_addr, info->ip_dst, INET_ADDRSTRLEN);
     freeaddrinfo(addrinfo_list);
     if (info->debug) {
-        setsockopt(info->snd_sock, SOL_SOCKET, SO_DEBUG, &on, sizeof(on));
-        setsockopt(info->rcv_sock, SOL_SOCKET, SO_DEBUG, &on, sizeof(on));
+        errno = 0;
+        if ((setsockopt(info->snd_sock, SOL_SOCKET, SO_DEBUG, &on, sizeof(on)) < 0) ||
+            (setsockopt(info->rcv_sock, SOL_SOCKET, SO_DEBUG, &on, sizeof(on)) < 0) ) {
+            printf("setsockopt SO_DEBUG: %s\n", strerror(errno));
+            return -1;
+        }
     }
     return 0;
 }
