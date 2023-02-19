@@ -1,4 +1,13 @@
 #include "ft_traceroute.h"
+#include "ft_getopt.h"
+
+struct timeval ms_to_timeval(uint32_t t)
+{
+    return (struct timeval){
+        .tv_sec  = t / 1000,
+        .tv_usec = (t % 1000) * 1000
+    };
+}
 
 double  delta_time(struct timeval *t1, struct timeval *t2)
 {
@@ -7,7 +16,7 @@ double  delta_time(struct timeval *t1, struct timeval *t2)
 
 int     resolve_destination(char *str, t_info *info)
 {
-    int error = 0, sockfd = 0;
+    int error = 0, on = 1;
     struct addrinfo hints = {0};
     struct addrinfo *addrinfo_list = 0, *tmp = 0;
     struct sockaddr_storage addr;
@@ -19,7 +28,7 @@ int     resolve_destination(char *str, t_info *info)
     hints.ai_flags = AI_CANONNAME;
 
     if ((error = getaddrinfo(str, 0, &hints, &addrinfo_list))) {
-        printf("%s: Name or service not known\n%s\n", str, gai_strerror(error));
+        printf("%s: %s\n", str, gai_strerror(error));
         return -2;
     }
     for (tmp = addrinfo_list; tmp; tmp = tmp->ai_next) {
@@ -38,20 +47,10 @@ int     resolve_destination(char *str, t_info *info)
     memcpy(info->canonname_dst, tmp->ai_canonname, strlen(tmp->ai_canonname));
     inet_ntop(addr.ss_family, (void *)&((struct sockaddr_in *)&addr)->sin_addr, info->ip_dst, INET_ADDRSTRLEN);
     freeaddrinfo(addrinfo_list);
-    return 0;
-}
-
-int     prepare_packet(t_info *info)
-{
-    struct ip *ip = 0;
-
-    if (!(info->packet_udp = calloc(info->len_packet+sizeof(struct udphdr)+sizeof(struct ip), sizeof(uint8_t))))
-        return -1;
-    ip = (struct ip *)(info->packet_udp);
-    ip->ip_tos = 0;
-    ip->ip_dst.s_addr = info->dst.sin_addr.s_addr;
-    ip->ip_v = IPVERSION;
-    ip->ip_id = 0;
+    if (info->debug) {
+        setsockopt(info->snd_sock, SOL_SOCKET, SO_DEBUG, &on, sizeof(on));
+        setsockopt(info->rcv_sock, SOL_SOCKET, SO_DEBUG, &on, sizeof(on));
+    }
     return 0;
 }
 
@@ -83,11 +82,8 @@ void    send_probe(t_info *info, uint32_t seq, uint32_t ttl)
 
 int     wait_response(t_info *info, struct sockaddr_in *addr)
 {
-    int addr_len = sizeof(struct sockaddr_in);
-    struct timeval timeout = {
-            .tv_sec = info->wait_time,
-            .tv_usec = 0,
-    };
+    socklen_t addr_len = sizeof(struct sockaddr_in);
+    struct timeval timeout = info->wait_time;
     int ret = 0;
     fd_set fds;
 
@@ -100,7 +96,7 @@ int     wait_response(t_info *info, struct sockaddr_in *addr)
     return ret;
 }
 
-int     check_packet(t_info *info, int ret, struct sockaddr_in *from, uint32_t seq)
+int     check_packet(t_info *info, int ret, uint32_t seq)
 {
     struct icmp *icmp = (struct icmp *)(info->packet_icmp + (((struct ip *)info->packet_icmp)->ip_hl << 2));
     struct ip *ip = 0;
@@ -112,7 +108,6 @@ int     check_packet(t_info *info, int ret, struct sockaddr_in *from, uint32_t s
         ip = &(icmp->icmp_ip);
         hlen = ip->ip_hl << 2;
         udp = (struct udphdr *)((uint8_t *)ip + hlen);
-        //printf("\nprotocol: %d\nhlen: %d\nsport: %d\ndport :%d\nident: %d - htons: %d\nport: %d - htons: %d\n", ip->ip_p, hlen, udp->uh_sport, udp->uh_dport, info->ident, htons(info->ident), info->port + seq, htons(info->port + seq));
         if (ip->ip_p == IPPROTO_UDP && udp->uh_sport == htons(info->ident) && udp->uh_dport == htons(info->port + seq)) {
             return (icmp->icmp_type == ICMP_TIMXCEED) ? ICMP_TIMXCEED : icmp->icmp_code;
         }
@@ -130,21 +125,19 @@ void    ft_traceroute(t_info *info)
     struct timezone tz;
 
     for (uint32_t ttl = 1; ttl <= info->hops_max; ++ttl) {
-        printf("%2d ", ttl);
-        fflush(stdout);
+        printf("%2d ", ttl); fflush(stdout);
         for (uint32_t probe = 0; probe < info->probe_max; ++probe, ++seq) {
             gettimeofday(&t1, &tz);
             send_probe(info, seq, ttl);
             while (1) {
                 ret = wait_response(info, &from);
                 gettimeofday(&t2, &tz);
-                if ((check = check_packet(info, ret, &from, seq)) >= 0) {
+                if ((check = check_packet(info, ret, seq)) >= 0) {
                     if (from.sin_addr.s_addr != last_addr) {
                         last_addr = from.sin_addr.s_addr;
                         getnameinfo((struct sockaddr *)&from, sizeof(struct sockaddr),
                                 hostname, sizeof(hostname), 0, 0, NI_IDN);
-                        printf(" %s (%s)", hostname, inet_ntoa(from.sin_addr));
-                        fflush(stdout);
+                        printf(" %s (%s)", hostname, inet_ntoa(from.sin_addr)); fflush(stdout);
                     }
                     printf("  %g ms", delta_time(&t1, &t2)); fflush(stdout);
                     break;
@@ -161,22 +154,59 @@ void    ft_traceroute(t_info *info)
     }
 }
 
+int     set_option(int ac, char **av, t_info *info)
+{
+    int c = 0;
+    ft_optind = 1;
+    info->hops_max = DEFAULT_HOPS_MAX;
+    info->len_packet = DEFAULT_SIZE_PACKET + sizeof(struct udphdr);
+    info->probe_max = DEFAULT_PROBE_MAX;
+    info->ident = (getpid() & 0xffff) | 0x8000;
+    info->wait_time = ms_to_timeval(DEFAULT_WAIT_TIME);
+    info->port = DEFAULT_PORT;
+
+    while ((c = ft_getopt(ac, av, "m:p:q:w:dh")) != -1) {
+        switch (c) {
+            case 'm':
+                info->hops_max = atoi(ft_optarg);
+                break;
+            case 'p':
+                info->port = atoi(ft_optarg);
+                if (info->port < 33434 || info->port > 33534) {
+                    printf("%s: Port not in range (33434 - 33534)\n", av[0]);
+                    return -1;
+                }
+                break;
+            case 'q':
+                info->probe_max = atoi(ft_optarg);
+                break;
+            case 'w':
+                info->wait_time = ms_to_timeval(atoi(ft_optarg));
+                break;
+            case 'd':
+                info->debug = 1;
+                break;
+            case 'h':
+                printf("%s [-hd] [-m max_ttl] [-p port] [-q nqueries] [-w waittimes (ms)] host\n", av[0]);
+                exit(0);
+        }
+    }
+    return 0;
+}
+
 int     main(int ac, char **av)
 {
     t_info info = {0};
 
-    info.hops_max = DEFAULT_HOPS_MAX;
-    info.len_packet = DEFAULT_SIZE_PACKET + sizeof(struct udphdr);
-    info.probe_max = DEFAULT_PROBE_MAX;
-    info.ident = (getpid() & 0xffff) | 0x8000;
-    info.wait_time = DEFAULT_WAIT_TIME;
-    info.port = DEFAULT_PORT;
-    if (resolve_destination(av[1], &info) < 0)
+    if (set_option(ac, av, &info) < 0)
         return 1;
+    if (resolve_destination(av[ft_optind], &info) < 0)
+        return 2;
     printf("ft_traceroute to %s (%s), %d hops max, %d byte packets\n",
            info.canonname_dst, info.ip_dst, info.hops_max, info.len_packet);
-    if (prepare_packet(&info) < 0)
-        return 2;
+    if (!(info.packet_udp = calloc(info.len_packet+sizeof(struct udphdr)+sizeof(struct ip),
+            sizeof(uint8_t))))
+        return 3;
     ft_traceroute(&info);
     free(info.packet_udp);
     close(info.snd_sock);

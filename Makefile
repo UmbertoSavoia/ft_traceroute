@@ -1,6 +1,6 @@
 TARGET = ft_traceroute
 CC = gcc
-CFLAGS = -g# -Wall -Wextra -Werror
+CFLAGS = -g -Wall -Wextra -Werror
 RM = rm -rf
 
 SRC = $(wildcard ./src/*.c)
